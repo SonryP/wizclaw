@@ -106,4 +106,4 @@ On relaunch, the wizard resumes from the last completed step.
 
 ## License
 
-[MIT](LICENSE) © Víctor Vásquez
+[MIT](LICENSE)
