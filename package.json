@@ -1,7 +1,11 @@
 {
-  "name": "nanoclaw-wizard",
+  "name": "wizclaw",
   "version": "1.0.0",
-  "description": "NanoClaw Setup Wizard — visual installer for non-technical users",
+  "description": "WizClaw — visual setup wizard for NanoClaw, a native installer for non-technical users",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SonryP/wizclaw.git"
+  },
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
