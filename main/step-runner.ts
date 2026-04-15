@@ -42,13 +42,23 @@ export class StepRunner {
     return new Promise((resolve, reject) => {
       this.emit('step-status', { step, status: 'running' });
 
+      // IMPORTANT: do NOT use shell: true here (on POSIX). With shell: true
+      // Node runs `sh -c "cmd arg1 arg2..."` which (a) lets shell
+      // metacharacters in args (@, parens, quotes) break parsing, and
+      // (b) inherits an open stdin pipe that some children can block on.
+      // Passing args directly to execvp avoids both problems, and
+      // stdin: 'ignore' guarantees the child can never hang waiting for
+      // input. On Windows we still need shell: true so that `npx` resolves
+      // to `npx.cmd`.
+      const isWin = process.platform === 'win32';
       const child = spawn(
-        'npx',
+        isWin ? 'npx.cmd' : 'npx',
         ['tsx', 'setup/index.ts', '--step', step, ...args],
         {
           cwd: nanoClawPath,
           env: { ...process.env, FORCE_COLOR: '0' },
-          shell: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          shell: isWin,
         },
       );
 
@@ -119,6 +129,9 @@ export class StepRunner {
         cwd: options.cwd,
         env: { ...process.env, ...options.env, FORCE_COLOR: '0' },
         shell: true,
+        // Never leave stdin open — some git subcommands (credential helper,
+        // editor prompts) will block on stdin forever if it's a pipe.
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
 
       this.activeProcesses.set(step, child);

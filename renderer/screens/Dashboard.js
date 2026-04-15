@@ -326,9 +326,12 @@ function AddChannelFlow({ installedChannels, onDone, onCancel, clearTerminal }) 
         : channel === 'discord' ? 'discord-chatid'
         : 'telegram-chatid';
       await window.wizard.startStep(stepName);
-      // For Telegram: chatInfo set by listener, move to register
-      // For Slack/Discord: channelList set by listener (needs_input), stay in detect for picker
+      // For Telegram: chatInfo set by listener, move to register.
+      // Must clear loading here so the Register button is enabled on
+      // the next screen — the needs_input listener only fires for
+      // Slack/Discord, not Telegram.
       if (channel === 'telegram') {
+        setLoading(false);
         setPhase('register');
       }
       // Slack/Discord: loading is cleared by the needs_input listener
@@ -365,6 +368,13 @@ function AddChannelFlow({ installedChannels, onDone, onCancel, clearTerminal }) 
         'assistant-name': assistantName,
         'channel': channel,
       });
+      // Restart the service so it picks up the newly merged channel code,
+      // freshly installed dependencies, and the new registered group row.
+      // Best-effort — if the restart fails the channel is still registered
+      // and the user can restart manually from the service controls.
+      try {
+        await window.wizard.restartService();
+      } catch { /* best effort */ }
       setPhase('done');
     } catch (err) {
       setError(err.message || 'Failed to register');
