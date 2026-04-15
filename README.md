@@ -1,5 +1,7 @@
 # WizClaw
 
+![WizClaw banner](./images/banner.png)
+
 Visual setup wizard for [NanoClaw](https://github.com/qwibitai/nanoclaw) — a
 native desktop installer that turns the CLI setup into a point-and-click
 experience for non-technical users.
