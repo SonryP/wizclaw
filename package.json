@@ -1,0 +1,38 @@
+{
+  "name": "nanoclaw-wizard",
+  "version": "1.0.0",
+  "description": "NanoClaw Setup Wizard — visual installer for non-technical users",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsc && electron dist/index.js",
+    "build": "tsc",
+    "start": "electron dist/index.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0"
+  },
+  "build": {
+    "appId": "com.nanoclaw.wizard",
+    "productName": "NanoClaw Setup",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "renderer/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
