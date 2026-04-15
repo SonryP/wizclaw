@@ -2,6 +2,8 @@
   "name": "wizclaw",
   "version": "1.0.0",
   "description": "WizClaw — visual setup wizard for NanoClaw, a native installer for non-technical users",
+  "license": "MIT",
+  "author": "Víctor Vásquez",
   "repository": {
     "type": "git",
     "url": "https://github.com/SonryP/wizclaw.git"
