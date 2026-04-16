@@ -101,10 +101,8 @@ On relaunch, the wizard resumes from the last completed step.
 ## Platform support
 
 - **macOS** — primary target, fully working (launchd service install)
-- **Linux** — service step uses systemd user units; other steps are
-  portable
-- **Windows** — `npx.cmd` resolution is in place but full flow is
-  untested
+- **Linux** — Soon
+- **Windows** — Soon
 
 ## License
 
