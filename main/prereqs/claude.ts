@@ -8,11 +8,24 @@ import fs from 'fs';
  * We check these explicitly because the Electron process may not have
  * an updated PATH after installation.
  */
-const CLAUDE_SEARCH_PATHS = [
-  path.join(os.homedir(), '.local', 'bin', 'claude'),
-  '/usr/local/bin/claude',
-  path.join(os.homedir(), '.claude', 'bin', 'claude'),
-];
+function getClaudeSearchPaths(): string[] {
+  if (process.platform === 'win32') {
+    const home = os.homedir();
+    const localAppData =
+      process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    return [
+      path.join(home, '.local', 'bin', 'claude.exe'),
+      path.join(localAppData, 'Programs', 'claude-code', 'claude.exe'),
+      path.join(appData, 'npm', 'claude.cmd'),
+    ];
+  }
+  return [
+    path.join(os.homedir(), '.local', 'bin', 'claude'),
+    '/usr/local/bin/claude',
+    path.join(os.homedir(), '.claude', 'bin', 'claude'),
+  ];
+}
 
 /**
  * Find the claude binary, checking PATH and known install locations.
@@ -20,20 +33,30 @@ const CLAUDE_SEARCH_PATHS = [
 function findClaudeBinary(): string | null {
   // First try PATH (works if already installed and PATH is set)
   try {
-    const which = execSync('which claude', {
+    const lookupCmd = process.platform === 'win32' ? 'where claude' : 'which claude';
+    const output = execSync(lookupCmd, {
       encoding: 'utf-8',
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
-    if (which) return which;
+    if (output) {
+      // `where` may return multiple lines — take the first match.
+      const first = output.split(/\r?\n/)[0]?.trim();
+      if (first) return first;
+    }
   } catch {
     // Not in PATH
   }
 
   // Check known install locations
-  for (const p of CLAUDE_SEARCH_PATHS) {
+  for (const p of getClaudeSearchPaths()) {
     try {
-      fs.accessSync(p, fs.constants.X_OK);
+      // Windows doesn't honor the X_OK bit the same way; a plain existence
+      // check is sufficient and works on both platforms.
+      fs.accessSync(
+        p,
+        process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK,
+      );
       return p;
     } catch {
       // Not here
@@ -44,24 +67,47 @@ function findClaudeBinary(): string | null {
 }
 
 /**
+ * Directories where claude is commonly installed. Used by getEnhancedPath()
+ * and installClaudeWindows() to know where to look / what to put on PATH.
+ */
+function getClaudeInstallDirs(): string[] {
+  if (process.platform === 'win32') {
+    const home = os.homedir();
+    const localAppData =
+      process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    return [
+      path.join(home, '.local', 'bin'),
+      path.join(localAppData, 'Programs', 'claude-code'),
+      path.join(appData, 'npm'),
+    ];
+  }
+  return [
+    path.join(os.homedir(), '.local', 'bin'),
+    '/usr/local/bin',
+    path.join(os.homedir(), '.claude', 'bin'),
+  ];
+}
+
+/**
  * Build a PATH that includes common claude install locations,
  * so spawned processes can find claude even if the user hasn't
  * sourced their shell profile yet.
  */
 function getEnhancedPath(): string {
   const existing = process.env.PATH || '';
-  const extraDirs = [
-    path.join(os.homedir(), '.local', 'bin'),
-    '/usr/local/bin',
-    path.join(os.homedir(), '.claude', 'bin'),
-  ];
-  const parts = existing.split(':');
-  for (const dir of extraDirs) {
-    if (!parts.includes(dir)) {
+  const parts = existing.split(path.delimiter).filter((p) => p.length > 0);
+  // Case-insensitive comparison on Windows so we don't double-prepend.
+  const eq = (a: string, b: string) =>
+    process.platform === 'win32'
+      ? a.toLowerCase() === b.toLowerCase()
+      : a === b;
+  for (const dir of getClaudeInstallDirs()) {
+    if (!parts.some((p) => eq(p, dir))) {
       parts.unshift(dir);
     }
   }
-  return parts.join(':');
+  return parts.join(path.delimiter);
 }
 
 export async function checkClaude(): Promise<{
@@ -86,9 +132,149 @@ export async function checkClaude(): Promise<{
   }
 }
 
+/**
+ * Persist `dir` on the current user's PATH (HKCU\Environment\Path) on Windows.
+ *
+ * We deliberately avoid `setx` — it truncates PATH at 1024 chars and expands
+ * %VAR% references into literals, which corrupts any existing user PATH.
+ * `[Environment]::SetEnvironmentVariable(..., 'User')` writes directly to the
+ * registry, has no length limit, and broadcasts WM_SETTINGCHANGE so newly
+ * spawned shells see the update. The User scope means no UAC prompt.
+ */
+function persistWindowsUserPath(
+  dir: string,
+  onOutput: (text: string) => void,
+): void {
+  // Embed the dir as a PowerShell single-quoted string; escape single quotes
+  // by doubling them per PowerShell quoting rules.
+  const escaped = dir.replace(/'/g, "''");
+  const script = `
+$dir = '${escaped}'
+$current = [Environment]::GetEnvironmentVariable('Path', 'User')
+$parts = @()
+if ($current) { $parts = $current -split ';' | Where-Object { $_ -ne '' } }
+$already = $false
+foreach ($p in $parts) { if ($p -ieq $dir) { $already = $true; break } }
+if (-not $already) {
+  $new = if ($current) { "$dir;$current" } else { $dir }
+  [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+  Write-Output 'PATH_UPDATED'
+} else {
+  Write-Output 'PATH_ALREADY_SET'
+}
+`.trim();
+  try {
+    const result = execSync(
+      `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command -`,
+      {
+        input: script,
+        encoding: 'utf-8',
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    ).trim();
+    if (result.includes('PATH_UPDATED')) {
+      onOutput(`Added ${dir} to your user PATH (persistent).\n`);
+    } else {
+      onOutput(`${dir} is already on your user PATH.\n`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    onOutput(`Warning: could not update persistent user PATH: ${msg}\n`);
+    onOutput(
+      'Claude should still work in this session, but you may need to reopen the wizard later.\n',
+    );
+  }
+}
+
+/**
+ * Windows-specific install path. Uses the official PowerShell installer,
+ * falls back to npm global, then makes sure the install dir is on both the
+ * persistent user PATH and the current Electron process's PATH so the next
+ * wizard step can immediately find claude.exe.
+ */
+async function installClaudeWindows(
+  onOutput: (text: string) => void,
+): Promise<boolean> {
+  onOutput('Installing Claude Code CLI (Windows)...\n');
+  onOutput('Using the official Anthropic PowerShell installer.\n\n');
+
+  // Run: powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://claude.ai/install.ps1 | iex"
+  const psSuccess = await runCommand(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      '"irm https://claude.ai/install.ps1 | iex"',
+    ],
+    onOutput,
+  );
+
+  if (!psSuccess) {
+    onOutput('\nPowerShell installer failed. Trying npm global install...\n');
+    const npmSuccess = await runCommand(
+      'npm',
+      ['install', '-g', '@anthropic-ai/claude-code'],
+      onOutput,
+    );
+    if (!npmSuccess) {
+      onOutput('\nAll installation methods failed.\n');
+      return false;
+    }
+    onOutput('\nClaude Code installed via npm!\n');
+  }
+
+  // Locate the freshly installed binary. The PowerShell installer drops
+  // claude.exe in %USERPROFILE%\.local\bin; the npm fallback drops a shim
+  // in %APPDATA%\npm. Both are covered by getClaudeSearchPaths().
+  const binary = findClaudeBinary();
+  if (!binary) {
+    onOutput(
+      '\nInstallation reported success but claude.exe was not found in any known location.\n',
+    );
+    return false;
+  }
+
+  const installDir = path.dirname(binary);
+
+  // Refresh the current Electron process's PATH so subsequent steps in this
+  // session can spawn claude without an app restart. Persistent PATH writes
+  // (step below) do not propagate to already-running processes.
+  const currentParts = (process.env.PATH || '')
+    .split(path.delimiter)
+    .filter((p) => p.length > 0);
+  const alreadyInSession = currentParts.some(
+    (p) => p.toLowerCase() === installDir.toLowerCase(),
+  );
+  if (!alreadyInSession) {
+    process.env.PATH = [installDir, ...currentParts].join(path.delimiter);
+    onOutput(`Added ${installDir} to PATH for this session.\n`);
+  }
+
+  // Persist to HKCU\Environment\Path as a safety net — the PS installer
+  // usually does this itself, but we don't rely on it.
+  persistWindowsUserPath(installDir, onOutput);
+
+  // Final verification.
+  const verify = findClaudeBinary();
+  if (verify) {
+    onOutput(`\nClaude Code installed successfully at ${verify}\n`);
+    return true;
+  }
+
+  onOutput('\nInstallation completed but verification failed.\n');
+  return false;
+}
+
 export async function installClaude(
   onOutput: (text: string) => void,
 ): Promise<boolean> {
+  if (process.platform === 'win32') {
+    return installClaudeWindows(onOutput);
+  }
+
   onOutput('Installing Claude Code CLI...\n');
   onOutput('Using the official Anthropic installer.\n\n');
 

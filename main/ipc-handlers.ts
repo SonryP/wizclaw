@@ -8,6 +8,77 @@ import { checkAllPrereqs, installPrereq } from './prereqs/index.js';
 import { runSetupToken } from './prereqs/claude.js';
 
 /**
+ * Windows only: defensively rewrite every .sh file in the cloned repo with
+ * LF line endings before we hand off to bash. This covers three stale-state
+ * scenarios that the clone-time `-c core.autocrlf=false` flag can't reach:
+ *
+ *   1. A clone produced by an older build of wizclaw (before the autocrlf
+ *      flag was added) that's still on disk.
+ *   2. A .gitattributes rule in the cloned repo that forces CRLF despite
+ *      the core.autocrlf override at clone time.
+ *   3. Any file materialized by a subsequent `git merge` / `git checkout`
+ *      that respected the user's global core.autocrlf.
+ *
+ * bash chokes on CRLF-terminated scripts with errors like
+ * `set: pipefail\r: invalid option name`, so one bad byte is enough to
+ * abort the entire bootstrap. This helper is idempotent and a no-op when
+ * the files are already LF, so it's safe to call every time.
+ *
+ * Platform-guarded at the call site — this is never invoked on macOS/Linux
+ * where CRLF is never introduced in the first place.
+ */
+function normalizeShellScriptsForBash(
+  repoDir: string,
+  window: BrowserWindow,
+  step: string,
+): void {
+  const fixed: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 4) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      // Skip dirs that would be huge, slow, or not source-controlled.
+      if (
+        entry.name === 'node_modules' ||
+        entry.name === '.git' ||
+        entry.name === 'dist' ||
+        entry.name === 'build'
+      ) {
+        continue;
+      }
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.sh')) {
+        try {
+          const content = fs.readFileSync(full, 'utf-8');
+          if (content.includes('\r')) {
+            const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+            fs.writeFileSync(full, normalized);
+            fixed.push(path.relative(repoDir, full));
+          }
+        } catch {
+          // Best-effort: skip files we can't read/write.
+        }
+      }
+    }
+  };
+  walk(repoDir, 0);
+  if (fixed.length > 0) {
+    window.webContents.send('wizard:output', {
+      step,
+      stream: 'stdout',
+      text: `Normalized LF line endings on ${fixed.length} shell script(s): ${fixed.join(', ')}\n`,
+    });
+  }
+}
+
+/**
  * Ensure the native credential proxy is merged into the NanoClaw install.
  * Idempotent — checks if already applied before doing anything.
  */
@@ -802,6 +873,57 @@ export function registerIpcHandlers(
 
       // ---- Bootstrap (setup.sh) ----
       if (step === 'bootstrap') {
+        // Windows-only: repair CRLF-damaged shell scripts before handing off
+        // to bash. No-op on macOS/Linux. See helper for the full rationale.
+        if (process.platform === 'win32') {
+          normalizeShellScriptsForBash(nanoClawPath!, window, step);
+        }
+
+        // Windows-only: preflight the Node version. setup.sh runs `npm ci`
+        // which pulls in `better-sqlite3`; on Windows with Node 23+ there's
+        // no prebuilt binary, so npm falls back to `node-gyp rebuild` which
+        // needs a specific VS version node-gyp recognizes. Rather than let
+        // the user hit a 50-line node-gyp stack trace deep inside
+        // setup.log, catch it here and tell them exactly what to do.
+        if (process.platform === 'win32') {
+          try {
+            const raw = execSync('node --version', {
+              encoding: 'utf-8',
+              timeout: 3000,
+            }).trim();
+            const major = parseInt(raw.replace('v', '').split('.')[0], 10);
+            if (!isNaN(major) && major > 22) {
+              const msg =
+                `\nFound Node.js ${raw}, which is too new for NanoClaw on Windows.\n\n` +
+                `NanoClaw uses better-sqlite3, a native module. Node 23+ has no\n` +
+                `prebuilt Windows binary yet, so npm falls back to compiling from\n` +
+                `source — which needs a specific Visual Studio version that\n` +
+                `node-gyp can recognize. Most people hit a dead end there.\n\n` +
+                `Fix: install Node.js 22 LTS from https://nodejs.org/ (uninstall\n` +
+                `Node ${raw} first, or use nvm-windows / fnm to switch between\n` +
+                `versions). Then restart this wizard and run bootstrap again.\n`;
+              window.webContents.send('wizard:output', {
+                step,
+                stream: 'stderr',
+                text: msg,
+              });
+              throw new Error(
+                `Node.js ${raw} is incompatible with NanoClaw on Windows — please install Node 22 LTS`,
+              );
+            }
+          } catch (err) {
+            // Re-throw our own preflight error; swallow anything else
+            // (e.g. `node --version` failing, which setup.sh will report
+            // via its own checks).
+            if (
+              err instanceof Error &&
+              err.message.includes('incompatible with NanoClaw')
+            ) {
+              throw err;
+            }
+          }
+        }
+
         const { code } = await stepRunner.runCommand(step, 'bash', ['setup.sh'], {
           cwd: nanoClawPath!,
         });
@@ -820,7 +942,15 @@ export function registerIpcHandlers(
       // ---- Git clone ----
       if (step === 'clone') {
         const targetPath = args?.path || nanoClawPath!;
+        // Force LF line endings regardless of the user's global
+        // core.autocrlf setting. On Windows, Git for Windows defaults to
+        // core.autocrlf=true, which silently rewrites setup.sh and every
+        // other shell script to CRLF on checkout. bash then chokes on
+        // `set -o pipefail\r` with "invalid option name". The `-c` flag
+        // applies the setting to this clone's initial checkout.
         const { code } = await stepRunner.runCommand(step, 'git', [
+          '-c',
+          'core.autocrlf=false',
           'clone',
           'https://github.com/qwibitai/nanoclaw.git',
           targetPath,
@@ -830,6 +960,20 @@ export function registerIpcHandlers(
             'Git clone failed — check terminal output for details',
           );
         }
+        // Persist core.autocrlf=false in the cloned repo's local config so
+        // future operations (merges, channel pulls, dependency repairs)
+        // don't re-introduce CRLF when touching the working tree.
+        await stepRunner
+          .runCommand(
+            step,
+            'git',
+            ['config', 'core.autocrlf', 'false'],
+            { cwd: targetPath },
+          )
+          .catch(() => {
+            // Non-fatal: the -c flag above already handled the initial
+            // checkout. If config write fails, clone still succeeded.
+          });
         stateManager.update({ nanoClawPath: targetPath });
         stateManager.markStepComplete(step, { path: targetPath });
         window.webContents.send('wizard:state-update', stateManager.get());

@@ -2,6 +2,26 @@ import { execSync, spawn } from 'child_process';
 
 const MIN_NODE_VERSION = 20;
 
+/**
+ * Maximum supported Node major version. Only enforced on Windows, where
+ * `better-sqlite3` (a nanoclaw dependency) doesn't publish prebuilt
+ * binaries for Node 23+ yet. Without a prebuild, npm falls back to
+ * `node-gyp rebuild`, which needs a specific vintage of Visual Studio
+ * that node-gyp's version table knows about — users with newer VS (e.g.
+ * the 2024 preview) hit an "unknown version" rejection and bootstrap
+ * dies inside `npm ci`. Capping at 22 (current LTS) routes Windows users
+ * to the prebuild path and avoids the compile-from-source trap entirely.
+ *
+ * macOS and Linux are uncapped: `better-sqlite3` has wider prebuild
+ * coverage on those platforms, and this cap would be an unnecessary
+ * regression for existing macOS users on Node 24.
+ *
+ * Bump this when better-sqlite3 ships newer prebuilds for Windows.
+ */
+function getMaxNodeVersion(): number {
+  return process.platform === 'win32' ? 22 : Infinity;
+}
+
 export async function checkNode(): Promise<{
   installed: boolean;
   version?: string;
@@ -9,7 +29,12 @@ export async function checkNode(): Promise<{
   try {
     const version = execSync('node --version', { encoding: 'utf-8' }).trim();
     const major = parseInt(version.replace('v', '').split('.')[0], 10);
-    return { installed: major >= MIN_NODE_VERSION, version };
+    const compatible =
+      major >= MIN_NODE_VERSION && major <= getMaxNodeVersion();
+    // Return installed:false for out-of-range versions so the prereqs UI
+    // prompts the user to fix it. `version` is still reported so the UI
+    // can show what they currently have.
+    return { installed: compatible, version };
   } catch {
     return { installed: false };
   }
