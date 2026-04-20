@@ -1,0 +1,72 @@
+name: Release
+
+# Triggers:
+#  - Push a tag like v1.0.0 to cut a real release (auto-publishes to GitHub Releases).
+#  - Manual "Run workflow" button for smoke-testing the build without a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for electron-builder to create the GitHub Release
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      # electron-builder reads package.json "build" config.
+      # On tag pushes we publish; on manual runs we just build artifacts.
+      - name: Build & publish (Windows)
+        if: matrix.os == 'windows-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --publish ${{ startsWith(github.ref, 'refs/tags/v') && 'always' || 'never' }}
+
+      - name: Build & publish (macOS)
+        if: matrix.os == 'macos-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Skip code-signing / notarization. Users will see a Gatekeeper warning
+          # on first launch — they can right-click → Open to bypass. Add signing
+          # later by setting CSC_LINK / CSC_KEY_PASSWORD and APPLE_ID secrets.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --mac --publish ${{ startsWith(github.ref, 'refs/tags/v') && 'always' || 'never' }}
+
+      # Upload artifacts on manual runs so you can download and smoke-test.
+      # On tag pushes these also get uploaded (in addition to the Release),
+      # which is useful if the Release step fails partway through.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wizclaw-${{ matrix.os }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+          if-no-files-found: ignore
+          retention-days: 14
