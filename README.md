@@ -102,7 +102,7 @@ On relaunch, the wizard resumes from the last completed step.
 
 - **macOS** — primary target, fully working (launchd service install)
 - **Linux** — Soon
-- **Windows** — Soon
+- **Windows** — working with the help of wsl2 and docker
 
 ## License
 
