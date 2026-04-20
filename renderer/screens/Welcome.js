@@ -8,17 +8,14 @@ export function Welcome({ onNext }) {
     <div class="screen welcome-screen">
       <div class="welcome-hero">
         <div class="welcome-logo">
-          <svg width="80" height="80" viewBox="0 0 80 80" fill="none">
-            <rect width="80" height="80" rx="20" fill="#6c5ce7"/>
-            <path d="M25 55 L40 25 L55 55 M30 45 H50" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <img src="../images/icon.png" alt="WizClaw" width="96" height="96" class="welcome-logo-img" />
         </div>
-        <h1 class="welcome-title">NanoClaw</h1>
-        <p class="welcome-subtitle">Set up your personal AI assistant</p>
+        <h1 class="welcome-title">WizClaw</h1>
+        <p class="welcome-subtitle">The setup wizard for NanoClaw</p>
         <p class="welcome-desc">
-          NanoClaw connects Claude to your favorite messaging apps — WhatsApp,
-          Telegram, Slack, Discord, and more. This wizard will guide you through
-          the entire setup process.
+          WizClaw guides you step-by-step through installing and configuring
+          NanoClaw — your personal AI assistant that connects Claude to WhatsApp,
+          Telegram, Slack, Discord, and more.
         </p>
       </div>
 

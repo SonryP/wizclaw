@@ -236,6 +236,13 @@ body {
   margin-bottom: 16px;
 }
 
+.welcome-logo-img {
+  display: inline-block;
+  border-radius: 22px;
+  object-fit: contain;
+  filter: drop-shadow(0 6px 20px var(--accent-glow));
+}
+
 .welcome-title {
   font-size: 36px;
   font-weight: 700;
