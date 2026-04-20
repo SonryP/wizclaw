@@ -49,7 +49,9 @@
       "Bash(MSYS_NO_PATHCONV=1 docker run -d --name nanoclaw-service -v \"C:/Users/Sonry/Documents/nanotest:/app\" -v \"nanoclaw-modules:/app/node_modules\" -v \"/var/run/docker.sock:/var/run/docker.sock\" -w /app nanoclaw-runtime sh -c \"echo boot && node dist/index.js 2>&1 | tee /tmp/nc.log; echo exitcode=$?\")",
       "Bash(grep -i pino find \"C:\\\\Users\\\\Sonry\\\\Documents\\\\nanotest\\\\node_modules\" -name \"pino\" -maxdepth 2 -type d)",
       "Bash(find C:\\\\\\\\Users\\\\\\\\Sonry\\\\\\\\Documents\\\\\\\\nanotest -name \"*whatsapp*\" -type f)",
-      "Bash(find C:\\\\\\\\Users\\\\\\\\Sonry\\\\\\\\Documents\\\\\\\\nanotest -type d -name \"setup\")"
+      "Bash(find C:\\\\\\\\Users\\\\\\\\Sonry\\\\\\\\Documents\\\\\\\\nanotest -type d -name \"setup\")",
+      "Bash(npx -y png2icons images/icon.png images/icon -icns -bc -allp)",
+      "Bash(npx -y png2icons images/icon.png images/icon -icns -bc -i)"
     ]
   }
 }

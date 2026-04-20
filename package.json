@@ -24,21 +24,24 @@
     "@types/node": "^22.10.0"
   },
   "build": {
-    "appId": "com.nanoclaw.wizard",
-    "productName": "NanoClaw Setup",
+    "appId": "com.wizclaw.app",
+    "productName": "WizClaw",
     "directories": {
       "output": "release"
     },
     "files": [
       "dist/**/*",
-      "renderer/**/*"
+      "renderer/**/*",
+      "images/**/*"
     ],
     "mac": {
       "category": "public.app-category.utilities",
-      "target": "dmg"
+      "target": "dmg",
+      "icon": "images/icon.icns"
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "images/icon.ico"
     }
   }
 }
