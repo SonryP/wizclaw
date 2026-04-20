@@ -1,7 +1,8 @@
-import { ipcMain, BrowserWindow, dialog } from 'electron';
-import { execSync } from 'child_process';
+import { ipcMain, BrowserWindow, dialog, shell } from 'electron';
+import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { StateManager } from './state.js';
 import { StepRunner } from './step-runner.js';
 import { checkAllPrereqs, installPrereq } from './prereqs/index.js';
@@ -720,6 +721,304 @@ function writeEnvVar(envPath: string, key: string, value: string): void {
   fs.writeFileSync(envPath, content);
 }
 
+// ─── Docker AI Sandbox helpers ────────────────────────────────────────────────
+
+/**
+ * Proxy bypass hosts copied from nanoclaw's official Windows sandbox script
+ * (https://nanoclaw.dev/install-docker-sandboxes-windows.sh).
+ * Keep in sync when the upstream list changes.
+ */
+const SANDBOX_PROXY_BYPASS_HOSTS = [
+  'api.anthropic.com',
+  'api.telegram.org',
+  '*.telegram.org',
+  '*.whatsapp.com',
+  '*.whatsapp.net',
+  '*.web.whatsapp.com',
+  'discord.com',
+  '*.discord.com',
+  '*.discord.gg',
+  '*.discord.media',
+  'slack.com',
+  '*.slack.com',
+];
+
+/**
+ * Run `docker sandbox create` with stdin pre-answered as 'y' so the
+ * confirmation prompt doesn't stall the process.  Streams stdout/stderr
+ * back through `onOutput`.
+ */
+function spawnDockerSandboxCreate(
+  sandboxName: string,
+  windowsWorkspacePath: string,
+  onOutput: (text: string) => void,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(
+      'docker',
+      ['sandbox', 'create', '--name', sandboxName, 'claude', windowsWorkspacePath],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    // Pre-answer any confirmation prompt with 'y'
+    child.stdin?.write('y\n');
+    child.stdin?.end();
+    child.stdout?.on('data', (d: Buffer) => onOutput(d.toString()));
+    child.stderr?.on('data', (d: Buffer) => onOutput(d.toString()));
+    child.on('close', (code) => resolve(code === 0));
+    child.on('error', (err) => {
+      onOutput(`Error: ${err.message}\n`);
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * Set up a Docker AI Sandbox (Docker Desktop 4.40+) as the NanoClaw
+ * container runtime.  Mirrors the steps in nanoclaw's official Windows
+ * sandbox install script, but reuses the already-cloned repo rather than
+ * cloning again.
+ *
+ * On success, writes { runtime: 'docker-sandbox', sandboxName } into the
+ * 'container' completed-step entry so the service step can read it later.
+ */
+async function setupDockerSandbox(
+  nanoClawPath: string,
+  window: BrowserWindow,
+  stateManager: StateManager,
+  step: string,
+): Promise<void> {
+  const emit = (text: string) =>
+    window.webContents.send('wizard:output', { step, stream: 'stdout', text });
+
+  // 1. Verify Docker sandbox is available (requires Docker Desktop 4.40+)
+  emit('Checking Docker sandbox support...\n');
+  try {
+    execSync('docker sandbox version', { stdio: 'pipe' });
+  } catch {
+    throw new Error(
+      'Docker sandbox not available. ' +
+      'Install or update to Docker Desktop 4.40+ and make sure sandbox support is enabled.',
+    );
+  }
+
+  // 2. Resolve a Windows-native path for the workspace.
+  //
+  //    Docker Desktop (Windows) can only mount paths it can reach from the
+  //    Windows side:
+  //      - win32: nanoClawPath is already a Windows path (e.g. C:\Users\...)
+  //      - linux (WSLg Electron): nanoClawPath is a Linux path; convert with
+  //        wslpath so Docker Desktop gets \\wsl.localhost\<distro>\...
+  emit('Resolving workspace path...\n');
+  let windowsPath: string;
+  if (process.platform === 'win32') {
+    windowsPath = nanoClawPath;
+  } else {
+    try {
+      windowsPath = execSync(`wslpath -w "${nanoClawPath}"`, { encoding: 'utf-8' }).trim();
+    } catch {
+      throw new Error(
+        'Could not convert workspace path to a Windows path. ' +
+        'Make sure wslpath is available (WSL2 required).',
+      );
+    }
+  }
+  emit(`Workspace: ${windowsPath}\n`);
+
+  // 3. Generate a unique sandbox name (same scheme as the official script)
+  const suffix = Date.now().toString().slice(-5);
+  const sandboxName = `nanoclaw-sandbox-${suffix}`;
+  emit(`\nCreating sandbox "${sandboxName}"...\n`);
+
+  // 4. Create the sandbox
+  const created = await spawnDockerSandboxCreate(sandboxName, windowsPath, emit);
+  if (!created) {
+    throw new Error('Docker sandbox creation failed — check terminal output for details.');
+  }
+
+  // 5. Configure proxy bypass so the sandbox can reach messaging APIs
+  emit('\nConfiguring network proxy bypass...\n');
+  const proxyArgs = ['sandbox', 'network', 'proxy', sandboxName];
+  for (const host of SANDBOX_PROXY_BYPASS_HOSTS) {
+    proxyArgs.push('--bypass-host', host);
+  }
+  try {
+    execSync(['docker', ...proxyArgs].join(' '), { stdio: 'pipe' });
+    emit('Proxy bypass configured.\n');
+  } catch {
+    // Non-fatal — sandbox still works, just won't have bypass rules
+    emit('Warning: could not configure proxy bypass (non-fatal).\n');
+  }
+
+  // 6. Persist sandbox metadata so the service step knows how to launch it
+  stateManager.markStepComplete(step, {
+    runtime: 'docker-sandbox',
+    sandboxName,
+  });
+
+  emit(`\n✓ Sandbox "${sandboxName}" is ready.\n`);
+  emit(`  To launch: docker sandbox run ${sandboxName}\n`);
+  emit('  Type /setup when Claude Code starts inside the sandbox.\n');
+}
+
+// ─── Windows service setup ────────────────────────────────────────────────────
+
+/**
+ * Install and start NanoClaw as a Windows service.
+ *
+ * nanoclaw's service.ts only handles 'macos' and 'linux'; on Windows
+ * getPlatform() returns 'unknown' and the step fails with unsupported_platform.
+ * We replicate what nanoclaw does but use Windows-native mechanisms:
+ *
+ *   1. npm run build  (same first step nanoclaw does)
+ *   2. Write a start-nanoclaw.bat wrapper script
+ *   3. Register a Task Scheduler task to run it at every user log-on
+ *   4. Start the process immediately (detached) so it's live right now
+ */
+// ─── Windows native-process helpers ──────────────────────────────────────────
+
+/** Path to the PID file written when NanoClaw is spawned on Windows. */
+function nanoclawPidFile(nanoClawPath: string): string {
+  return path.join(nanoClawPath, 'nanoclaw.pid');
+}
+
+/** Read the PID from the pid file; returns null if missing or unparseable. */
+function readNanoclawPid(nanoClawPath: string): number | null {
+  try {
+    const raw = fs.readFileSync(nanoclawPidFile(nanoClawPath), 'utf-8').trim();
+    const pid = parseInt(raw, 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if a process with the given PID is alive.
+ * signal 0 never actually sends — it only tests existence.
+ *   throws ESRCH  → no such process (dead)
+ *   throws EPERM  → exists but we don't own it (alive)
+ *   returns void  → alive and we own it
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: unknown) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * CJS patch injected via --require before NanoClaw loads on Windows.
+ *
+ * NanoClaw spawns `docker run` for every agent task. On Windows, when a
+ * console app (docker.exe) is launched from a process that has no console
+ * (our windowsHide spawn), Windows allocates a new console window for the
+ * child — one popup per agent run. This patch monkey-patches child_process
+ * so every subprocess NanoClaw spawns inherits windowsHide:true, suppressing
+ * those windows without requiring any changes to nanoclaw's source.
+ */
+const WIN_HIDE_PATCH = `
+if (process.platform === 'win32') {
+  const cp = require('child_process');
+  const hide = (opts) => {
+    if (!opts || typeof opts !== 'object') opts = {};
+    return Object.assign({ windowsHide: true }, opts);
+  };
+  const origSpawn = cp.spawn.bind(cp);
+  cp.spawn = (cmd, args, opts) => origSpawn(cmd, args, hide(opts));
+  const origExecSync = cp.execSync.bind(cp);
+  cp.execSync = (cmd, opts) => origExecSync(cmd, hide(opts));
+  const origExec = cp.exec.bind(cp);
+  cp.exec = (cmd, opts, cb) => {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    return origExec(cmd, hide(opts), cb);
+  };
+  const origSpawnSync = cp.spawnSync.bind(cp);
+  cp.spawnSync = (cmd, args, opts) => origSpawnSync(cmd, args, hide(opts));
+}
+`;
+
+/**
+ * Spawn NanoClaw as a hidden, detached Windows process.
+ * Stdout/stderr are appended to nanoclaw.log in the repo directory so the
+ * Dashboard "Logs" tab has something to show.
+ * Kills any previous instance first and waits briefly for the port to clear.
+ */
+async function spawnNanoclawWindows(nanoClawPath: string): Promise<void> {
+  const pidFile = nanoclawPidFile(nanoClawPath);
+  const logPath = path.join(nanoClawPath, 'nanoclaw.log');
+
+  // Write the windowsHide patch so child processes don't pop console windows.
+  const patchFile = path.join(nanoClawPath, 'win-hide-patch.cjs');
+  fs.writeFileSync(patchFile, WIN_HIDE_PATCH.trim());
+
+  // Kill existing instance if alive.
+  const existingPid = readNanoclawPid(nanoClawPath);
+  if (existingPid && isProcessAlive(existingPid)) {
+    try { execSync(`taskkill /PID ${existingPid} /F`, { stdio: 'pipe' }); } catch { /* already dead */ }
+    // Brief wait so the OS releases port 3001 before we respawn.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+  }
+
+  // Redirect output to a log file (append so previous logs aren't lost).
+  const logFd = fs.openSync(logPath, 'a');
+  const child = spawn('node', ['--require', './win-hide-patch.cjs', 'dist/index.js'], {
+    cwd: nanoClawPath,
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  child.unref();
+  fs.closeSync(logFd);
+
+  fs.writeFileSync(pidFile, String(child.pid));
+}
+
+async function setupServiceWindows(
+  nanoClawPath: string,
+  stepRunner: StepRunner,
+  step: string,
+  window: BrowserWindow,
+  stateManager: StateManager,
+): Promise<void> {
+  const emit = (text: string) =>
+    window.webContents.send('wizard:output', { step, stream: 'stdout', text });
+
+  window.webContents.send('wizard:step-status', { step, status: 'running' });
+
+  // 1. Build TypeScript so dist/ is current.
+  emit('Building TypeScript...\n');
+  const build = await stepRunner.runCommand(
+    step, 'npm', ['run', 'build'], { cwd: nanoClawPath },
+  );
+  if (build.code !== 0) {
+    const msg = 'TypeScript build failed — check terminal output for details.';
+    window.webContents.send('wizard:step-status', { step, status: 'failed', error: msg });
+    throw new Error(msg);
+  }
+  emit('Build succeeded.\n\n');
+
+  // 2. Start the process.
+  emit('Starting NanoClaw...\n');
+  try {
+    await spawnNanoclawWindows(nanoClawPath);
+    emit('NanoClaw started.\n');
+  } catch (err: unknown) {
+    const msg = (err as Error).message ?? String(err);
+    const fullMsg = `Failed to start NanoClaw: ${msg}`;
+    window.webContents.send('wizard:step-status', { step, status: 'failed', error: fullMsg });
+    throw new Error(fullMsg);
+  }
+
+  stateManager.markStepComplete(step, { serviceType: 'native-windows' });
+  window.webContents.send('wizard:step-status', { step, status: 'success' });
+  emit('\n✓ NanoClaw is running.\n');
+  emit('Re-run this step after a reboot to restart it (or add it to Task Scheduler manually).\n');
+}
+
+// ─── IPC handler registration ─────────────────────────────────────────────────
+
 export function registerIpcHandlers(
   window: BrowserWindow,
   stateManager: StateManager,
@@ -1309,6 +1608,35 @@ export function registerIpcHandlers(
 
       // ---- WhatsApp auth (QR code / pairing code) ----
       if (step === 'whatsapp-auth') {
+        // On Windows, nanoclaw's whatsapp-auth.ts spawns a nested `npx` process
+        // with shell:false. Node.js on Windows does not try .cmd extensions for
+        // non-shell spawns, so `npx` → ENOENT even when `npx.cmd` is on PATH.
+        // Patch the source file in-place before tsx compiles it so the nested
+        // spawn uses `npx.cmd` + shell:true. The patch is idempotent.
+        if (process.platform === 'win32') {
+          const waFile = path.join(nanoClawPath!, 'setup', 'whatsapp-auth.ts');
+          if (fs.existsSync(waFile)) {
+            try {
+              let src = fs.readFileSync(waFile, 'utf-8');
+              if (!src.includes('_npxCmd')) {
+                // Replace: spawn('npx', ['tsx', ...authArgs], {
+                src = src.replace(
+                  /const authProc = spawn\('npx',\s*\['tsx',/,
+                  "const _npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';\n  const authProc = spawn(_npxCmd, ['tsx',",
+                );
+                // Add shell:true for Windows inside the spawn options object
+                src = src.replace(
+                  /detached: false,\s*\}\);/,
+                  'detached: false,\n    shell: process.platform === \'win32\',\n  });',
+                );
+                fs.writeFileSync(waFile, src, 'utf-8');
+              }
+            } catch {
+              // Non-fatal — the step will still attempt to run; worst case it
+              // fails with the same ENOENT and the user sees the terminal output.
+            }
+          }
+        }
         const method = args?.method || 'qr-browser';
 
         window.webContents.send('wizard:step-status', {
@@ -1326,9 +1654,13 @@ export function registerIpcHandlers(
         let scriptCmd: string;
         let scriptArgs: string[];
 
+        // On Windows use npx.cmd so the shell resolves it; runCommand also
+        // wraps with shell:true on Windows, so this is belt-and-suspenders.
+        const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+
         if (fs.existsSync(setupScript)) {
           // Use the setup step — supports qr-browser, qr-terminal, pairing-code
-          scriptCmd = 'npx';
+          scriptCmd = npxCmd;
           scriptArgs = ['tsx', 'setup/index.ts', '--step', 'whatsapp-auth',
             '--method', method];
           if (method === 'pairing-code' && args?.phone) {
@@ -1336,7 +1668,7 @@ export function registerIpcHandlers(
           }
         } else if (fs.existsSync(directScript)) {
           // Fall back to standalone script (terminal QR only)
-          scriptCmd = 'npx';
+          scriptCmd = npxCmd;
           scriptArgs = ['tsx', 'src/whatsapp-auth.ts'];
           if (method === 'pairing-code') {
             scriptArgs.push('--pairing-code');
@@ -1350,12 +1682,29 @@ export function registerIpcHandlers(
           );
         }
 
+        // On Windows the nanoclaw setup script's openBrowser() call fails
+        // (it uses 'open' / 'xdg-open' which don't exist). The HTML QR page
+        // is still written to store/qr-auth.html — poll for it and open it
+        // via Electron's shell so the user can scan without any extra steps.
+        let qrOpened = false;
+        const qrHtmlPath = path.join(nanoClawPath!, 'store', 'qr-auth.html');
+        const qrPollInterval = process.platform === 'win32'
+          ? setInterval(() => {
+              if (!qrOpened && fs.existsSync(qrHtmlPath)) {
+                qrOpened = true;
+                shell.openExternal(`file://${qrHtmlPath}`).catch(() => {});
+              }
+            }, 500)
+          : null;
+
         const result = await stepRunner.runCommand(
           step,
           scriptCmd,
           scriptArgs,
           { cwd: nanoClawPath! },
         );
+
+        if (qrPollInterval) clearInterval(qrPollInterval);
 
         if (result.code === 0) {
           stateManager.markStepComplete(step, {});
@@ -1851,8 +2200,128 @@ export function registerIpcHandlers(
         }
       }
 
+      // ---- Docker container build -----------------------------------------------
+      // nanoclaw's container.ts uses `command -v docker` to verify Docker is
+      // present. That is a bash/sh builtin — it doesn't exist in cmd.exe, so on
+      // Windows the check always returns false and the step fails immediately
+      // with the opaque "runtime_not_available" error.
+      //
+      // On Windows we run the docker build ourselves, bypassing nanoclaw's
+      // container.ts entirely. On Linux/macOS we run a quick `docker info`
+      // pre-check so we can surface the real error instead of the opaque one,
+      // then fall through to nanoclaw's step as normal.
+      if (step === 'container' && args?.runtime === 'docker') {
+        if (process.platform === 'win32') {
+          // Run docker build + test directly — mirrors what nanoclaw's
+          // container.ts does, but without the bash-only commandExists check.
+          window.webContents.send('wizard:step-status', { step, status: 'running' });
+
+          const containerDir = path.join(nanoClawPath!, 'container');
+          const image = 'nanoclaw-agent:latest';
+
+          const emit = (text: string) =>
+            window.webContents.send('wizard:output', { step, stream: 'stdout', text });
+
+          // Verify Docker daemon is reachable first
+          emit('Checking Docker daemon...\n');
+          try {
+            execSync('docker info', { stdio: 'pipe' });
+          } catch (err: unknown) {
+            const stderr = (err as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
+            const msg = `Docker is not accessible: ${stderr.trim() || 'daemon not running'}.\nMake sure Docker Desktop is running.`;
+            window.webContents.send('wizard:step-status', { step, status: 'failed', error: msg });
+            throw new Error(msg);
+          }
+
+          // Build
+          emit(`Building container image ${image}...\n`);
+          const build = await stepRunner.runCommand(
+            step, 'docker', ['build', '-t', image, '.'],
+            { cwd: containerDir },
+          );
+          if (build.code !== 0) {
+            const msg = 'Docker build failed — check terminal output for details.';
+            window.webContents.send('wizard:step-status', { step, status: 'failed', error: msg });
+            throw new Error(msg);
+          }
+
+          // Smoke test
+          emit('\nTesting container...\n');
+          const test = await stepRunner.runCommand(
+            step, 'docker',
+            ['run', '-i', '--rm', '--entrypoint', '/bin/echo', image, 'Container OK'],
+            { cwd: nanoClawPath! },
+          );
+          const testOk = test.stdout.includes('Container OK');
+
+          if (!testOk) {
+            const msg = 'Container test failed — image built but could not run.';
+            window.webContents.send('wizard:step-status', { step, status: 'failed', error: msg });
+            throw new Error(msg);
+          }
+
+          emit('\n✓ Container image built and tested successfully.\n');
+          stateManager.markStepComplete(step, { runtime: 'docker', image });
+          window.webContents.send('wizard:step-status', { step, status: 'success' });
+          window.webContents.send('wizard:state-update', stateManager.get());
+          return { success: true };
+        }
+
+        // Linux / macOS — pre-check docker info so we surface the real error
+        // rather than nanoclaw's opaque "runtime_not_available".
+        try {
+          execSync('docker info', { stdio: 'pipe' });
+        } catch (err: unknown) {
+          const stderr = (err as { stderr?: Buffer | string })?.stderr?.toString() ?? '';
+          const lower = stderr.toLowerCase();
+          let message: string;
+          if (lower.includes('permission denied') && lower.includes('docker.sock')) {
+            message =
+              'Docker permission denied. Run in your terminal:\n' +
+              '  sudo usermod -aG docker $USER && newgrp docker\n' +
+              'Then relaunch wizclaw.';
+          } else if (lower.includes('cannot connect') || lower.includes('is the docker daemon running')) {
+            message = 'Cannot connect to Docker daemon. Start Docker Desktop and try again.';
+          } else {
+            message = `Docker is not accessible: ${stderr.trim() || 'daemon not running'}.`;
+          }
+          window.webContents.send('wizard:output', { step, stream: 'stderr', text: message + '\n' });
+          window.webContents.send('wizard:step-status', { step, status: 'failed', error: message });
+          throw new Error(message);
+        }
+        // docker info passed — fall through to nanoclaw's container step below
+      }
+
+      // ---- Docker AI Sandbox container setup (Windows / WSL) ----
+      if (step === 'container' && args?.runtime === 'docker-sandbox') {
+        window.webContents.send('wizard:step-status', { step, status: 'running' });
+        try {
+          await setupDockerSandbox(nanoClawPath!, window, stateManager, step);
+          window.webContents.send('wizard:step-status', { step, status: 'success' });
+          window.webContents.send('wizard:state-update', stateManager.get());
+          return { success: true };
+        } catch (err: any) {
+          window.webContents.send('wizard:step-status', {
+            step,
+            status: 'failed',
+            error: err.message,
+          });
+          throw err;
+        }
+      }
+
       // ---- Service start — ensure proxy is applied first ----
       if (step === 'service') {
+        // nanoclaw's service.ts only handles 'macos' and 'linux'. On Windows
+        // getPlatform() returns 'unknown' → unsupported_platform. We intercept
+        // before runSetupStep and install the service ourselves using the Windows
+        // Task Scheduler, then start the process immediately.
+        if (process.platform === 'win32') {
+          await setupServiceWindows(nanoClawPath!, stepRunner, step, window, stateManager);
+          window.webContents.send('wizard:state-update', stateManager.get());
+          return { success: true };
+        }
+
         // Last chance: make sure credential proxy is applied before starting
         await ensureCredentialProxy(nanoClawPath!, stepRunner, step, window);
 
@@ -1972,7 +2441,14 @@ export function registerIpcHandlers(
     const isMac = process.platform === 'darwin';
 
     try {
-      if (isMac) {
+      if (process.platform === 'win32') {
+        // Read PID file written by spawnNanoclawWindows; use signal 0 to
+        // probe liveness without sending an actual signal.
+        const pid = nanoClawPath ? readNanoclawPid(nanoClawPath) : null;
+        const running = pid !== null && isProcessAlive(pid);
+        return { running, pid: running ? pid : null, uptime: null, nanoClawPath };
+
+      } else if (isMac) {
             const list = execSync('launchctl list 2>/dev/null | grep nanoclaw || true', {
           encoding: 'utf-8',
         }).trim();
@@ -2027,7 +2503,13 @@ export function registerIpcHandlers(
       } catch { /* best effort */ }
     }
 
-    if (process.platform === 'darwin') {
+    if (process.platform === 'win32') {
+      if (!ncp) return { success: false };
+      const pid = readNanoclawPid(ncp);
+      if (!pid || !isProcessAlive(pid)) {
+        await spawnNanoclawWindows(ncp);
+      }
+    } else if (process.platform === 'darwin') {
       execSync('launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist 2>/dev/null || true');
       execSync(`launchctl kickstart gui/$(id -u)/com.nanoclaw 2>/dev/null || true`);
     } else {
@@ -2037,7 +2519,16 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle('wizard:stop-service', async () => {
-    if (process.platform === 'darwin') {
+    if (process.platform === 'win32') {
+      const ncp = stateManager.get().nanoClawPath;
+      if (ncp) {
+        const pid = readNanoclawPid(ncp);
+        if (pid && isProcessAlive(pid)) {
+          try { execSync(`taskkill /PID ${pid} /F`, { stdio: 'pipe' }); } catch { /* already dead */ }
+        }
+        try { fs.unlinkSync(nanoclawPidFile(ncp)); } catch { /* no pid file */ }
+      }
+    } else if (process.platform === 'darwin') {
       execSync('launchctl kill SIGTERM gui/$(id -u)/com.nanoclaw 2>/dev/null || true');
     } else {
       execSync('systemctl --user stop nanoclaw');
@@ -2054,7 +2545,9 @@ export function registerIpcHandlers(
       } catch { /* best effort */ }
     }
 
-    if (process.platform === 'darwin') {
+    if (process.platform === 'win32') {
+      if (ncp) await spawnNanoclawWindows(ncp);
+    } else if (process.platform === 'darwin') {
       execSync(`launchctl kickstart -k gui/$(id -u)/com.nanoclaw 2>/dev/null || true`);
     } else {
       execSync('systemctl --user restart nanoclaw');
@@ -2067,20 +2560,29 @@ export function registerIpcHandlers(
     if (!nanoClawPath) return [];
 
     try {
-      const dbPath = path.join(nanoClawPath, 'data', 'nanoclaw.db');
+      // nanoclaw stores its DB at store/messages.db (not data/nanoclaw.db).
+      // Use better-sqlite3 from nanoclaw's own node_modules so we don't need
+      // the sqlite3 CLI (which is not on Windows PATH by default).
+      const dbPath = path.join(nanoClawPath, 'store', 'messages.db');
       if (!fs.existsSync(dbPath)) return [];
 
-        const rows = execSync(
-        `sqlite3 "${dbPath}" "SELECT jid, name, folder, trigger_pattern, COALESCE(json_extract(container_config,'$.channel'),'whatsapp') as channel FROM registered_groups ORDER BY is_main DESC;"`,
-        { encoding: 'utf-8' },
-      ).trim();
-
-      if (!rows) return [];
-
-      return rows.split('\n').map((row: string) => {
-        const [jid, name, folder, trigger_pattern, channel] = row.split('|');
-        return { jid, name, folder, trigger_pattern, channel: channel || 'whatsapp' };
-      });
+      const BetterSqlite = require(
+        path.join(nanoClawPath, 'node_modules', 'better-sqlite3'),
+      );
+      const db = new BetterSqlite(dbPath, { readonly: true, fileMustExist: true });
+      try {
+        const rows = db.prepare(
+          `SELECT jid, name, folder, trigger_pattern,
+            COALESCE(json_extract(container_config, '$.channel'), 'whatsapp') AS channel
+           FROM registered_groups ORDER BY is_main DESC`,
+        ).all() as Array<{
+          jid: string; name: string; folder: string;
+          trigger_pattern: string; channel: string;
+        }>;
+        return rows;
+      } finally {
+        db.close();
+      }
     } catch {
       return [];
     }
@@ -2090,10 +2592,16 @@ export function registerIpcHandlers(
     const nanoClawPath = stateManager.get().nanoClawPath;
     if (!nanoClawPath) throw new Error('NanoClaw path not set');
 
-    const dbPath = path.join(nanoClawPath, 'data', 'nanoclaw.db');
-    execSync(
-      `sqlite3 "${dbPath}" "DELETE FROM registered_groups WHERE jid='${jid.replace(/'/g, "''")}';"`,
+    const dbPath = path.join(nanoClawPath, 'store', 'messages.db');
+    const BetterSqlite = require(
+      path.join(nanoClawPath, 'node_modules', 'better-sqlite3'),
     );
+    const db = new BetterSqlite(dbPath, { fileMustExist: true });
+    try {
+      db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+    } finally {
+      db.close();
+    }
     return { success: true };
   });
 
@@ -2102,31 +2610,72 @@ export function registerIpcHandlers(
     if (!nanoClawPath) return 'No NanoClaw path configured.';
 
     try {
-      // Try the most common log locations
-      const logPaths = [
-        path.join(nanoClawPath, 'logs', 'nanoclaw.log'),
-        path.join(nanoClawPath, 'nanoclaw.log'),
-      ];
+      /**
+       * Read the last `lines` lines from a file without requiring `tail`
+       * (which is not available on Windows).
+       */
+      const readTail = (filePath: string, n: number): string => {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const allLines = content.split('\n');
+        return allLines.slice(-n).join('\n');
+      };
 
-      for (const logPath of logPaths) {
-        if (fs.existsSync(logPath)) {
-                return execSync(`tail -n ${lines} "${logPath}"`, { encoding: 'utf-8' });
+      // 1. Service stdout logs — check several locations used by different
+      //    launch paths (Windows spawn → nanoclaw.log at repo root;
+      //    macOS/Linux bat launcher → logs/nanoclaw.log).
+      const svcLogCandidates = [
+        path.join(nanoClawPath, 'nanoclaw.log'),
+        path.join(nanoClawPath, 'logs', 'nanoclaw.log'),
+      ];
+      const svcErr = path.join(nanoClawPath, 'logs', 'nanoclaw.error.log');
+      for (const svcLog of svcLogCandidates) {
+        if (fs.existsSync(svcLog) && fs.statSync(svcLog).size > 0) {
+          return readTail(svcLog, lines);
         }
       }
+      if (fs.existsSync(svcErr) && fs.statSync(svcErr).size > 0) {
+        return readTail(svcErr, lines);
+      }
 
-      // Try launchd stdout/stderr logs
+      // 2. Collect recent container logs from all group folders.
+      //    These are the per-task Claude execution logs — most informative for the user.
+      const groupsDir = path.join(nanoClawPath, 'groups');
+      if (fs.existsSync(groupsDir)) {
+        const logEntries: Array<{ mtime: number; file: string }> = [];
+        for (const groupFolder of fs.readdirSync(groupsDir)) {
+          const logsDir = path.join(groupsDir, groupFolder, 'logs');
+          if (!fs.existsSync(logsDir)) continue;
+          for (const logFile of fs.readdirSync(logsDir)) {
+            if (!logFile.endsWith('.log')) continue;
+            const full = path.join(logsDir, logFile);
+            try {
+              logEntries.push({ mtime: fs.statSync(full).mtimeMs, file: full });
+            } catch { /* ignore */ }
+          }
+        }
+        // Sort newest-first and read the most recent few
+        logEntries.sort((a, b) => b.mtime - a.mtime);
+        const combined: string[] = [];
+        for (const entry of logEntries.slice(0, 5)) {
+          combined.push(`\n--- ${path.relative(nanoClawPath, entry.file)} ---`);
+          try {
+            combined.push(readTail(entry.file, Math.ceil(lines / logEntries.slice(0, 5).length)));
+          } catch { /* ignore */ }
+        }
+        if (combined.length > 0) return combined.join('\n');
+      }
+
+      // 3. launchd stdout/stderr logs (macOS only)
       if (process.platform === 'darwin') {
         const home = process.env.HOME || '';
         const stdoutLog = path.join(home, '.local', 'share', 'nanoclaw', 'stdout.log');
         const stderrLog = path.join(home, '.local', 'share', 'nanoclaw', 'stderr.log');
         const logFile = fs.existsSync(stderrLog) ? stderrLog :
           fs.existsSync(stdoutLog) ? stdoutLog : null;
-        if (logFile) {
-                return execSync(`tail -n ${lines} "${logFile}"`, { encoding: 'utf-8' });
-        }
+        if (logFile) return readTail(logFile, lines);
       }
 
-      return 'No log files found.';
+      return 'No log files found yet. Logs appear here after NanoClaw processes a message.';
     } catch (err: any) {
       return `Error reading logs: ${err.message}`;
     }

@@ -5,7 +5,7 @@ import { checkClaude, installClaude } from './claude.js';
 
 export interface PrereqStatus {
   node: { installed: boolean; version?: string };
-  docker: { installed: boolean; running?: boolean; version?: string };
+  docker: { installed: boolean; running?: boolean; version?: string; hint?: string };
   git: { installed: boolean; version?: string };
   claude: { installed: boolean; version?: string };
 }

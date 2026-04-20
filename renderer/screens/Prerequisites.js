@@ -5,11 +5,16 @@ import { PrereqCard } from '../components/PrereqCard.js';
 
 const html = htm.bind(h);
 
+const NODE_DESCRIPTION =
+  window.wizard.platform === 'win32'
+    ? 'JavaScript runtime (version 20–22 required on Windows)'
+    : 'JavaScript runtime (version 20 or higher)';
+
 const PREREQS = [
   {
     name: 'node',
     label: 'Node.js',
-    description: 'JavaScript runtime (version 20 or higher)',
+    description: NODE_DESCRIPTION,
   },
   {
     name: 'docker',
@@ -35,6 +40,11 @@ export function Prerequisites({ onNext, onBack, prereqStatus }) {
     setChecking(true);
     window.wizard.checkPrereqs().then(() => setChecking(false));
   }, []);
+
+  const handleRecheck = () => {
+    setChecking(true);
+    window.wizard.checkPrereqs().then(() => setChecking(false));
+  };
 
   const handleInstall = async (name) => {
     await window.wizard.installPrereq(name);
@@ -93,6 +103,14 @@ export function Prerequisites({ onNext, onBack, prereqStatus }) {
       <div class="screen-actions">
         <button class="btn btn-ghost" onClick=${onBack}>Back</button>
         <div class="actions-right">
+          <button
+            class="btn btn-ghost"
+            onClick=${handleRecheck}
+            disabled=${checking}
+            title="Re-run all prerequisite checks (useful after installing something while the wizard was already open)"
+          >
+            ${checking ? 'Checking…' : 'Re-check'}
+          </button>
           ${someMissing && html`
             <button class="btn btn-secondary" onClick=${handleInstallAll}>
               Install All Missing

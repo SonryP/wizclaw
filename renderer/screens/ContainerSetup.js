@@ -5,6 +5,46 @@ import { ProgressBar } from '../components/ProgressBar.js';
 
 const html = htm.bind(h);
 
+/**
+ * Turn raw error codes from nanoclaw's container setup into sentences a
+ * non-technical user can act on.
+ */
+function friendlyError(error, runtime) {
+  if (error === 'runtime_not_available') {
+    const platform = window.wizard.platform;
+    if (runtime === 'docker') {
+      if (platform === 'linux') {
+        // Likely WSL — Docker Desktop WSL integration is the usual culprit
+        return (
+          'Docker is not accessible. If you are using WSL, open Docker Desktop on ' +
+          'Windows → Settings → Resources → WSL Integration and enable it for your ' +
+          'distro, then click Retry. Alternatively, run "sudo service docker start" ' +
+          'in your WSL terminal and click Retry.'
+        );
+      }
+      if (platform === 'win32') {
+        return (
+          'Docker Desktop is not running. Open Docker Desktop from the Start menu, ' +
+          'wait for it to finish starting, then click Retry.'
+        );
+      }
+      // macOS
+      return (
+        'Docker Desktop is not running. Open Docker Desktop from your Applications ' +
+        'folder, wait for the whale icon to appear in the menu bar, then click Retry.'
+      );
+    }
+    if (runtime === 'apple-container') {
+      return (
+        'Apple Container is not installed. Install it from the Apple developer portal ' +
+        'and try again.'
+      );
+    }
+  }
+  // Fallback: show the raw error but still readable
+  return error || 'Container build failed. Check the terminal output for details.';
+}
+
 export function ContainerSetup({ onNext, onBack, stepStatus, clearTerminal }) {
   const [runtime, setRuntime] = useState('docker');
   const [building, setBuilding] = useState(false);
@@ -79,7 +119,7 @@ export function ContainerSetup({ onNext, onBack, stepStatus, clearTerminal }) {
 
         ${error && html`
           <div class="error-box">
-            <p>${error}</p>
+            <p>${friendlyError(error, runtime)}</p>
             <button class="btn btn-sm btn-primary" onClick=${handleBuild}>
               Retry
             </button>
