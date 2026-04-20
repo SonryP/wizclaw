@@ -3,19 +3,23 @@
    ======================================== */
 
 :root {
-  --bg-primary: #0f0f13;
-  --bg-secondary: #1a1a24;
-  --bg-tertiary: #242436;
-  --bg-hover: #2a2a3e;
-  --bg-card: #1e1e2e;
+  /* Dark surface scale — derived from #313437 */
+  --bg-primary: #1c1e20;     /* deepest — app background */
+  --bg-secondary: #24272a;   /* inputs, instruction boxes */
+  --bg-tertiary: #313437;    /* base tone — chips, tracks */
+  --bg-card: #2a2d30;        /* cards */
+  --bg-hover: #3a3e42;       /* hover surfaces */
 
-  --text-primary: #e4e4ef;
-  --text-secondary: #9898b0;
-  --text-muted: #6e6e88;
+  --text-primary: #e6ebec;
+  --text-secondary: #a3afb1;
+  --text-muted: #707b7e;
 
-  --accent: #6c5ce7;
-  --accent-hover: #7f71ed;
-  --accent-subtle: rgba(108, 92, 231, 0.15);
+  /* Teal accent scale — derived from #24B7B7 */
+  --accent: #24B7B7;
+  --accent-hover: #3ED1D1;
+  --accent-active: #1C9A9A;
+  --accent-subtle: rgba(36, 183, 183, 0.15);
+  --accent-glow: rgba(36, 183, 183, 0.35);
 
   --success: #2ecc71;
   --success-bg: rgba(46, 204, 113, 0.12);
@@ -24,8 +28,8 @@
   --error: #e74c3c;
   --error-bg: rgba(231, 76, 60, 0.12);
 
-  --border: #2d2d42;
-  --border-focus: #6c5ce7;
+  --border: #3a3e42;
+  --border-focus: #24B7B7;
 
   --radius-sm: 6px;
   --radius-md: 10px;
@@ -126,7 +130,7 @@ body {
 .stepper-item.active .stepper-dot {
   border-color: var(--accent);
   background: var(--accent-subtle);
-  box-shadow: 0 0 10px rgba(108, 92, 231, 0.3);
+  box-shadow: 0 0 10px var(--accent-glow);
 }
 
 .stepper-item.completed .stepper-dot {
@@ -230,6 +234,13 @@ body {
 
 .welcome-logo {
   margin-bottom: 16px;
+}
+
+.welcome-logo-img {
+  display: inline-block;
+  border-radius: 22px;
+  object-fit: contain;
+  filter: drop-shadow(0 6px 20px var(--accent-glow));
 }
 
 .welcome-title {
@@ -723,7 +734,7 @@ body {
   height: 200px;
   overflow-y: auto;
   overflow-x: auto;
-  background: #0a0a0f;
+  background: #14171a;
   padding: 12px 16px;
   border-top: 1px solid var(--border);
   resize: vertical;
@@ -847,7 +858,7 @@ body {
   gap: 8px;
   margin-top: 6px;
   padding: 8px 12px;
-  background: #0a0a0f;
+  background: #14171a;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 14px;
@@ -1444,6 +1455,10 @@ body {
   background: #c0392b;
 }
 
+.btn-primary:active:not(:disabled) {
+  background: var(--accent-active);
+}
+
 /* Extra-small button */
 .btn-xs {
   font-size: 12px;
@@ -1460,7 +1475,7 @@ body {
   font-size: 11px;
   line-height: 1.6;
   color: var(--text-secondary);
-  background: #0a0a0f;
+  background: #14171a;
   margin: 0;
   padding: 14px 16px;
   max-height: 400px;

@@ -16,6 +16,7 @@ export function PrereqCard({ name, label, description, status, onInstall }) {
   const isInstalled = status?.installed;
   const isRunning = name === 'docker' ? status?.running : true;
   const version = status?.version;
+  const hint = status?.hint;
 
   let statusIcon = '';
   let statusClass = '';
@@ -36,7 +37,9 @@ export function PrereqCard({ name, label, description, status, onInstall }) {
   } else {
     statusIcon = '\u2717';
     statusClass = 'missing';
-    statusText = 'Not installed';
+    // If a version was detected but is out-of-range, say so — "Not installed"
+    // is confusing when the binary *is* there but is the wrong version.
+    statusText = version ? `Incompatible: ${version}` : 'Not installed';
   }
 
   return html`
@@ -48,6 +51,7 @@ export function PrereqCard({ name, label, description, status, onInstall }) {
         <h3 class="prereq-name">${label}</h3>
         <p class="prereq-desc">${description}</p>
         <p class="prereq-version">${statusText}</p>
+        ${hint && html`<p class="prereq-hint">${hint}</p>`}
       </div>
       <div class="prereq-action">
         ${!isInstalled && html`

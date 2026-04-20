@@ -5,6 +5,7 @@ import htm from 'htm';
 const html = htm.bind(h);
 
 export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
+  const isWindows = window.wizard.platform === 'win32';
   const [credType, setCredType] = useState(null); // 'subscription' | 'api-key'
   const [token, setToken] = useState('');
   const [saving, setSaving] = useState(false);
@@ -95,10 +96,17 @@ export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
           <div class="instruction-box">
             <h3>Get your Claude token</h3>
             <ol>
-              <li>
-                Open <strong>Terminal</strong> on your Mac
-                <span class="hint">(Spotlight ${'→'} type "Terminal" ${'→'} Enter)</span>
-              </li>
+              ${isWindows ? html`
+                <li>
+                  Open <strong>Command Prompt</strong> or <strong>PowerShell</strong>
+                  <span class="hint">(press Win + R ${'→'} type "cmd" ${'→'} Enter)</span>
+                </li>
+              ` : html`
+                <li>
+                  Open <strong>Terminal</strong> on your Mac
+                  <span class="hint">(Spotlight ${'→'} type "Terminal" ${'→'} Enter)</span>
+                </li>
+              `}
               <li>
                 Type this command and press Enter:
                 <div class="code-block">
@@ -110,7 +118,7 @@ export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
                 </div>
               </li>
               <li>Your browser will open — sign in with your Claude account</li>
-              <li>A token will appear in Terminal (starts with <code>sk-ant-oat</code>)</li>
+              <li>A token will appear in the terminal (starts with <code>sk-ant-oat</code>)</li>
               <li>Copy the token and paste it below</li>
             </ol>
           </div>
