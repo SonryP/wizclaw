@@ -6,8 +6,9 @@ const html = htm.bind(h);
 
 export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
   const isWindows = window.wizard.platform === 'win32';
-  const [credType, setCredType] = useState(null); // 'subscription' | 'api-key'
+  const [credType, setCredType] = useState(null); // 'subscription' | 'api-key' | 'ollama'
   const [token, setToken] = useState('');
+  const [ollamaModel, setOllamaModel] = useState('llama3.1:8b');
   const [saving, setSaving] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState(null);
@@ -27,6 +28,23 @@ export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
       setDone(true);
     } catch (err) {
       setError(err.message || 'Failed to save credentials');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleOllamaSetup = async () => {
+    setSaving(true);
+    setError(null);
+    clearTerminal();
+    try {
+      await window.wizard.startStep('credentials', {
+        type: 'ollama',
+        model: ollamaModel,
+      });
+      setDone(true);
+    } catch (err) {
+      setError(err.message || 'Failed to set up local model');
     } finally {
       setSaving(false);
     }
@@ -87,6 +105,17 @@ export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
               from the developer console.
             </p>
             <span class="option-tag">Pay per use</span>
+          </button>
+          <button
+            class="option-card"
+            onClick=${() => setCredType('ollama')}
+          >
+            <h3>Run locally (Ollama)</h3>
+            <p>
+              Run a local model on your computer. Free and private,
+              but quality varies.
+            </p>
+            <span class="option-tag">Experimental</span>
           </button>
         </div>
       `}
@@ -212,15 +241,72 @@ export function Credentials({ onNext, onBack, stepStatus, clearTerminal }) {
         </div>
       `}
 
+      ${credType === 'ollama' && !done && html`
+        <div class="credential-form">
+          <div class="instruction-box">
+            <h3>Run a model locally</h3>
+            <ol>
+              <li>WizClaw installs Ollama if it's not already on your machine.</li>
+              <li>Downloads the model you pick below (first time only — several GB).</li>
+              <li>Starts a small translation proxy so NanoClaw can talk to it.</li>
+            </ol>
+            <p class="form-hint">
+              <strong>Experimental:</strong> local models can misfire on complex
+              agent tasks. You can switch back to Claude any time from this screen.
+            </p>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Model</label>
+            <select
+              class="form-input"
+              value=${ollamaModel}
+              onChange=${(e) => setOllamaModel(e.target.value)}
+            >
+              <option value="llama3.1:8b">llama3.1:8b — recommended, native tool calling (~5 GB)</option>
+              <option value="mistral-nemo:12b">mistral-nemo:12b — function-calling tuned (~7 GB)</option>
+              <option value="qwen2.5:14b">qwen2.5:14b — highest quality, better reasoning (~9 GB)</option>
+            </select>
+            <p class="form-hint">
+              These models have been tested with NanoClaw's tool-calling flow.
+              Other Ollama models may work but quality varies — you can switch
+              by editing <code>NANOCLAW_LOCAL_MODEL</code> in <code>.env</code>
+              and restarting the service.
+            </p>
+          </div>
+
+          ${error && html`
+            <div class="error-box">
+              <p>${error}</p>
+            </div>
+          `}
+
+          <div style="display: flex; gap: 10px;">
+            <button
+              class="btn btn-primary"
+              onClick=${handleOllamaSetup}
+              disabled=${saving}
+            >
+              ${saving ? 'Setting up...' : 'Install & start'}
+            </button>
+            <button class="btn btn-ghost" onClick=${() => { setCredType(null); setError(null); }}>
+              Other methods
+            </button>
+          </div>
+        </div>
+      `}
+
       ${done && html`
         <div class="success-box">
           <span class="success-icon">${'\u2713'}</span>
           <div>
             <p>Credentials saved successfully!</p>
             <p class="success-detail">
-              ${credType === 'subscription' || token.startsWith('sk-ant-oat')
-                ? 'Claude subscription token configured.'
-                : 'API key configured.'}
+              ${credType === 'ollama'
+                ? `Local model (${ollamaModel}) configured via Ollama proxy.`
+                : (credType === 'subscription' || token.startsWith('sk-ant-oat'))
+                  ? 'Claude subscription token configured.'
+                  : 'API key configured.'}
             </p>
           </div>
         </div>

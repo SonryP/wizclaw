@@ -418,8 +418,13 @@ body {
 
 .option-cards {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 24px;
+}
+
+.option-cards .option-card {
+  min-width: 180px;
 }
 
 .option-cards.compact {
@@ -429,6 +434,7 @@ body {
 .option-card {
   flex: 1;
   padding: 18px;
+  padding-bottom: 36px;
   background: var(--bg-card);
   border: 2px solid var(--border);
   border-radius: var(--radius-md);
@@ -463,7 +469,7 @@ body {
 
 .option-tag {
   position: absolute;
-  top: 10px;
+  bottom: 10px;
   right: 10px;
   font-size: 11px;
   padding: 2px 8px;

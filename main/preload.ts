@@ -5,6 +5,10 @@ export interface ServiceInfo {
   pid: number | null;
   uptime: string | null;
   nanoClawPath: string | null;
+  credType?: string | null;
+  ollamaModel?: string | null;
+  proxyRunning?: boolean;
+  proxyPid?: number | null;
 }
 
 export interface GroupInfo {
@@ -45,6 +49,7 @@ export interface WizardAPI {
   startService(): Promise<{ success: boolean }>;
   stopService(): Promise<{ success: boolean }>;
   restartService(): Promise<{ success: boolean }>;
+  switchOllamaModel(model: string): Promise<{ success: boolean; model: string }>;
   getGroups(): Promise<GroupInfo[]>;
   removeGroup(jid: string): Promise<{ success: boolean }>;
   getRecentLogs(lines?: number): Promise<string>;
@@ -124,6 +129,7 @@ const api: WizardAPI = {
   startService: () => ipcRenderer.invoke('wizard:start-service'),
   stopService: () => ipcRenderer.invoke('wizard:stop-service'),
   restartService: () => ipcRenderer.invoke('wizard:restart-service'),
+  switchOllamaModel: (model) => ipcRenderer.invoke('wizard:switch-ollama-model', model),
   getGroups: () => ipcRenderer.invoke('wizard:get-groups'),
   removeGroup: (jid) => ipcRenderer.invoke('wizard:remove-group', jid),
   getRecentLogs: (lines) => ipcRenderer.invoke('wizard:get-logs', lines),

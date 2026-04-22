@@ -164,6 +164,98 @@ function ChannelsCard({ channels, onRemove, onAddChannel }) {
   `;
 }
 
+// Models we've validated against NanoClaw's tool-calling flow. Keep in
+// sync with renderer/screens/Credentials.js.
+const OLLAMA_MODELS = [
+  { value: 'llama3.1:8b',      label: 'llama3.1:8b — recommended, native tool calling (~5 GB)' },
+  { value: 'mistral-nemo:12b', label: 'mistral-nemo:12b — function-calling tuned (~7 GB)' },
+  { value: 'qwen2.5:14b',      label: 'qwen2.5:14b — highest quality, better reasoning (~9 GB)' },
+];
+
+function OllamaCard({ currentModel, proxyRunning, proxyPid, onSwitch, switching }) {
+  const [selected, setSelected] = useState(currentModel || OLLAMA_MODELS[0].value);
+  const [customModel, setCustomModel] = useState('');
+  const [useCustom, setUseCustom] = useState(false);
+
+  useEffect(() => {
+    // If the current model isn't in our known list, flip to custom entry.
+    if (currentModel && !OLLAMA_MODELS.find((m) => m.value === currentModel)) {
+      setUseCustom(true);
+      setCustomModel(currentModel);
+    } else if (currentModel) {
+      setSelected(currentModel);
+    }
+  }, [currentModel]);
+
+  const target = useCustom ? customModel.trim() : selected;
+  const canSwitch = target && target !== currentModel && !switching;
+
+  return html`
+    <div class="dash-card">
+      <div class="dash-card-header">
+        <h3><${StatusDot} running=${proxyRunning} /> Ollama Proxy</h3>
+        <span class="dash-badge ${proxyRunning ? 'badge-success' : 'badge-error'}">
+          ${proxyRunning ? 'Running' : 'Stopped'}
+        </span>
+      </div>
+      <div class="dash-card-body">
+        <div class="dash-meta">
+          ${proxyPid && html`<span>PID: <strong>${proxyPid}</strong></span>`}
+          ${currentModel && html`<span>Model: <strong>${currentModel}</strong></span>`}
+        </div>
+        <div class="form-group" style="margin-top: 8px;">
+          <label class="form-label">Switch model</label>
+          ${!useCustom && html`
+            <select
+              class="form-input"
+              value=${selected}
+              onChange=${(e) => setSelected(e.target.value)}
+              disabled=${switching}
+            >
+              ${OLLAMA_MODELS.map((m) => html`
+                <option key=${m.value} value=${m.value}>${m.label}</option>
+              `)}
+            </select>
+          `}
+          ${useCustom && html`
+            <input
+              type="text"
+              class="form-input"
+              value=${customModel}
+              onInput=${(e) => setCustomModel(e.target.value)}
+              placeholder="e.g. qwen2.5:32b"
+              disabled=${switching}
+            />
+          `}
+          <p class="form-hint" style="margin-top: 6px;">
+            <button
+              class="btn btn-ghost btn-xs"
+              onClick=${() => setUseCustom(!useCustom)}
+              disabled=${switching}
+            >
+              ${useCustom ? 'Pick from list' : 'Use a custom Ollama tag'}
+            </button>
+          </p>
+        </div>
+        <div class="dash-actions">
+          <button
+            class="btn btn-primary btn-sm"
+            onClick=${() => onSwitch(target)}
+            disabled=${!canSwitch}
+          >
+            ${switching ? 'Switching...' : 'Pull & switch'}
+          </button>
+        </div>
+        <p class="form-hint" style="margin-top: 8px;">
+          Pulls the model if needed, updates <code>.env</code>, then restarts
+          the proxy and NanoClaw service. Pulls can take several minutes on
+          first use.
+        </p>
+      </div>
+    </div>
+  `;
+}
+
 function LogsCard({ logs, onRefresh, loading }) {
   return html`
     <div class="dash-card dash-card-logs">
@@ -816,6 +908,7 @@ export function Dashboard({ wizardState, onBack, clearTerminal }) {
   const [logsLoading, setLogsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('overview');
   const [addingChannel, setAddingChannel] = useState(false);
+  const [switchingModel, setSwitchingModel] = useState(false);
 
   const nanoClawPath = wizardState?.nanoClawPath || null;
 
@@ -902,6 +995,19 @@ export function Dashboard({ wizardState, onBack, clearTerminal }) {
     window.wizard.openFolder(folderPath);
   };
 
+  const handleSwitchOllamaModel = async (model) => {
+    if (!model) return;
+    setSwitchingModel(true);
+    if (clearTerminal) clearTerminal();
+    try {
+      await window.wizard.switchOllamaModel(model);
+      setTimeout(refreshStatus, 1500);
+    } catch (err) {
+      alert(`Switch failed: ${err.message || err}`);
+    }
+    setSwitchingModel(false);
+  };
+
   const handleAddChannelDone = () => {
     setAddingChannel(false);
     refreshChannels();
@@ -955,6 +1061,16 @@ export function Dashboard({ wizardState, onBack, clearTerminal }) {
             onOpenFolder=${handleOpenFolder}
             nanoClawPath=${nanoClawPath}
           />
+
+          ${serviceInfo?.credType === 'ollama' && html`
+            <${OllamaCard}
+              currentModel=${serviceInfo?.ollamaModel}
+              proxyRunning=${serviceInfo?.proxyRunning}
+              proxyPid=${serviceInfo?.proxyPid}
+              onSwitch=${handleSwitchOllamaModel}
+              switching=${switchingModel}
+            />
+          `}
         </div>
 
         ${nanoClawPath && html`

@@ -7,6 +7,8 @@ import { StateManager } from './state.js';
 import { StepRunner } from './step-runner.js';
 import { checkAllPrereqs, installPrereq } from './prereqs/index.js';
 import { runSetupToken } from './prereqs/claude.js';
+import { ensureOllama } from './prereqs/ollama.js';
+import { PROXY_SOURCE } from './proxy/anthropic-ollama.js';
 
 /**
  * Windows only: defensively rewrite every .sh file in the cloned repo with
@@ -975,6 +977,152 @@ async function spawnNanoclawWindows(nanoClawPath: string): Promise<void> {
   fs.writeFileSync(pidFile, String(child.pid));
 }
 
+// ─── Ollama proxy helpers ────────────────────────────────────────────────────
+
+/**
+ * The Anthropic↔Ollama proxy lives in NanoClaw's dir as `anthropic-ollama-proxy.cjs`,
+ * next to `win-hide-patch.cjs`. Spawned as a detached Node child with PID tracked
+ * at `proxy.pid`. Same shape as `spawnNanoclawWindows` so the service lifecycle
+ * handlers treat both processes uniformly.
+ */
+const PROXY_FILENAME = 'anthropic-ollama-proxy.cjs';
+const PROXY_PID_FILENAME = 'proxy.pid';
+const PROXY_LOG_FILENAME = 'proxy.log';
+const DEFAULT_PROXY_PORT = 11435;
+
+function proxyPidFile(nanoClawPath: string): string {
+  return path.join(nanoClawPath, PROXY_PID_FILENAME);
+}
+
+function readProxyPid(nanoClawPath: string): number | null {
+  try {
+    const raw = fs.readFileSync(proxyPidFile(nanoClawPath), 'utf-8').trim();
+    const pid = parseInt(raw, 10);
+    return isNaN(pid) ? null : pid;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Spawn the Anthropic↔Ollama proxy as a detached Node child. Writes the proxy
+ * source to disk (idempotent) next to win-hide-patch.cjs, kills any previous
+ * instance, writes the new PID to proxy.pid. Model + port are passed via env.
+ */
+async function spawnProxy(
+  nanoClawPath: string,
+  model: string,
+  port: number,
+): Promise<void> {
+  const proxyPath = path.join(nanoClawPath, PROXY_FILENAME);
+  fs.writeFileSync(proxyPath, PROXY_SOURCE);
+
+  // Make sure the hide patch exists too, in case the user launched the proxy
+  // from the credentials step before NanoClaw has ever been spawned.
+  if (process.platform === 'win32') {
+    const patchFile = path.join(nanoClawPath, 'win-hide-patch.cjs');
+    if (!fs.existsSync(patchFile)) {
+      fs.writeFileSync(patchFile, WIN_HIDE_PATCH.trim());
+    }
+  }
+
+  // Kill existing proxy if alive.
+  const existingPid = readProxyPid(nanoClawPath);
+  if (existingPid && isProcessAlive(existingPid)) {
+    try {
+      if (process.platform === 'win32') {
+        execSync(`taskkill /PID ${existingPid} /F`, { stdio: 'pipe' });
+      } else {
+        process.kill(existingPid, 'SIGTERM');
+      }
+    } catch {
+      // already dead
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  }
+
+  const logPath = path.join(nanoClawPath, PROXY_LOG_FILENAME);
+  const logFd = fs.openSync(logPath, 'a');
+
+  const spawnArgs =
+    process.platform === 'win32'
+      ? ['--require', './win-hide-patch.cjs', `./${PROXY_FILENAME}`]
+      : [`./${PROXY_FILENAME}`];
+
+  const child = spawn('node', spawnArgs, {
+    cwd: nanoClawPath,
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
+    env: {
+      ...process.env,
+      PROXY_PORT: String(port),
+      OLLAMA_MODEL: model,
+    },
+  });
+  child.unref();
+  fs.closeSync(logFd);
+
+  if (child.pid) {
+    fs.writeFileSync(proxyPidFile(nanoClawPath), String(child.pid));
+  }
+}
+
+/**
+ * Start the proxy only if the user's saved credType is 'ollama'. No-op for
+ * Claude subscription / API key flows. Called from the service-start and
+ * service-restart handlers, where we don't have the model at hand but we do
+ * have it persisted in wizard state from the credentials step.
+ */
+async function maybeStartProxy(
+  nanoClawPath: string,
+  stateManager: StateManager,
+): Promise<void> {
+  const meta = stateManager.get().completedSteps?.credentials;
+  if (!meta || meta.type !== 'ollama') return;
+  const model = meta.model || 'qwen2.5-coder:7b';
+  const existingPid = readProxyPid(nanoClawPath);
+  if (existingPid && isProcessAlive(existingPid)) return; // already up
+  await spawnProxy(nanoClawPath, model, DEFAULT_PROXY_PORT);
+}
+
+/** Kill the proxy if alive and remove its PID file. Safe to call always. */
+function stopProxy(nanoClawPath: string): void {
+  const pid = readProxyPid(nanoClawPath);
+  if (pid && isProcessAlive(pid)) {
+    try {
+      if (process.platform === 'win32') {
+        execSync(`taskkill /PID ${pid} /F`, { stdio: 'pipe' });
+      } else {
+        process.kill(pid, 'SIGTERM');
+      }
+    } catch {
+      // already dead
+    }
+  }
+  try {
+    fs.unlinkSync(proxyPidFile(nanoClawPath));
+  } catch {
+    // no pid file
+  }
+}
+
+/**
+ * Remove a key from a .env file, leaving other lines untouched.
+ * Used when switching credential types (e.g. Ollama → Claude subscription
+ * needs ANTHROPIC_BASE_URL removed so Claude Code hits the real Anthropic API).
+ */
+function removeEnvVar(envPath: string, key: string): void {
+  let content = '';
+  try {
+    content = fs.readFileSync(envPath, 'utf-8');
+  } catch {
+    return; // nothing to remove
+  }
+  const lines = content.split('\n').filter((l) => !l.startsWith(`${key}=`));
+  fs.writeFileSync(envPath, lines.join('\n'));
+}
+
 async function setupServiceWindows(
   nanoClawPath: string,
   stepRunner: StepRunner,
@@ -1146,7 +1294,74 @@ export function registerIpcHandlers(
         const tokenValue = args?.token?.trim();
         const credType = args?.type;
 
-        // Validate before saving
+        // ---- Ollama local-inference branch (experimental) ----
+        if (credType === 'ollama') {
+          if (!nanoClawPath) {
+            throw new Error(
+              'NanoClaw must be cloned before configuring a local model.',
+            );
+          }
+          const model = (args?.model && args.model.trim()) || 'qwen2.5-coder:7b';
+          const port = DEFAULT_PROXY_PORT;
+          window.webContents.send('wizard:step-status', { step, status: 'running' });
+          const onOutput = (text: string) => {
+            window.webContents.send('wizard:output', {
+              step,
+              stream: 'stdout',
+              text,
+            });
+          };
+
+          // 1. Install Ollama + start daemon (if not already).
+          const ready = await ensureOllama(onOutput);
+          if (!ready) {
+            throw new Error(
+              'Ollama setup failed — check terminal output for details.',
+            );
+          }
+
+          // 2. Pull the selected model, streaming progress to the terminal.
+          onOutput(`\nPulling model ${model}... (this can take a while on first run)\n`);
+          const pull = await stepRunner.runCommand(step, 'ollama', ['pull', model]);
+          if (pull.code !== 0) {
+            throw new Error(
+              `Failed to pull ${model} — check terminal output for details.`,
+            );
+          }
+
+          // 3. Spawn the Anthropic↔Ollama translation proxy.
+          onOutput(`\nStarting translation proxy on 127.0.0.1:${port}...\n`);
+          await spawnProxy(nanoClawPath, model, port);
+
+          // 4. Point NanoClaw's Claude Code at the proxy via .env.
+          const envPath = path.join(nanoClawPath, '.env');
+          // NanoClaw's architecture: the container talks to a host-side
+          // credential proxy (port 3001), which in turn reads
+          // ANTHROPIC_BASE_URL from .env and forwards there. Since the
+          // credential proxy runs on the host, our proxy URL must be
+          // 127.0.0.1 (NOT host.docker.internal — that resolves to the
+          // WSL bridge IP on Windows and isn't reachable from the host).
+          writeEnvVar(envPath, 'ANTHROPIC_BASE_URL', `http://127.0.0.1:${port}`);
+          writeEnvVar(envPath, 'ANTHROPIC_API_KEY', 'sk-ant-ollama-dummy');
+          writeEnvVar(envPath, 'NANOCLAW_LOCAL_MODEL', model);
+          // Claude Code validates the model name client-side against its
+          // built-in list and rejects unknown names (e.g. NanoClaw's default
+          // claude-sonnet-4-6) before any HTTP call, so the proxy never sees
+          // the request. Pin to a known-good name; the proxy ignores this
+          // value and always routes to OLLAMA_MODEL.
+          writeEnvVar(envPath, 'ANTHROPIC_MODEL', 'sonnet');
+          // Remove any stale OAuth token so Claude Code doesn't prefer it.
+          removeEnvVar(envPath, 'CLAUDE_CODE_OAUTH_TOKEN');
+
+          onOutput('\nLocal model configured. NanoClaw will talk to Ollama via the proxy.\n');
+
+          stateManager.markStepComplete(step, { type: 'ollama', model });
+          window.webContents.send('wizard:step-status', { step, status: 'success' });
+          window.webContents.send('wizard:state-update', stateManager.get());
+          return { success: true };
+        }
+
+        // ---- Subscription / API key branch ----
         if (!tokenValue || !tokenValue.startsWith('sk-ant-')) {
           throw new Error(
             'Invalid credential. API keys start with "sk-ant-api" and tokens start with "sk-ant-oat". Please check and try again.',
@@ -1160,6 +1375,13 @@ export function registerIpcHandlers(
               ? 'CLAUDE_CODE_OAUTH_TOKEN'
               : 'ANTHROPIC_API_KEY';
           writeEnvVar(envPath, key, tokenValue);
+
+          // Switching away from Ollama: strip the base-URL override and stop
+          // the proxy so Claude Code hits the real Anthropic API again.
+          removeEnvVar(envPath, 'ANTHROPIC_BASE_URL');
+          removeEnvVar(envPath, 'NANOCLAW_LOCAL_MODEL');
+          removeEnvVar(envPath, 'ANTHROPIC_MODEL');
+          stopProxy(nanoClawPath);
         }
         stateManager.markStepComplete(step, { type: credType || 'api-key' });
         window.webContents.send('wizard:step-status', {
@@ -2440,13 +2662,31 @@ export function registerIpcHandlers(
     const nanoClawPath = stateManager.get().nanoClawPath;
     const isMac = process.platform === 'darwin';
 
+    // Proxy status is orthogonal to NanoClaw's — a user on Ollama has both
+    // running. Include it in every response so the dashboard can surface it.
+    const proxyPid = nanoClawPath ? readProxyPid(nanoClawPath) : null;
+    const proxyRunning = proxyPid !== null && isProcessAlive(proxyPid);
+    const credType =
+      stateManager.get().completedSteps?.credentials?.type || null;
+    const ollamaModel =
+      (stateManager.get().completedSteps?.credentials as { model?: string } | undefined)?.model || null;
+
     try {
       if (process.platform === 'win32') {
         // Read PID file written by spawnNanoclawWindows; use signal 0 to
         // probe liveness without sending an actual signal.
         const pid = nanoClawPath ? readNanoclawPid(nanoClawPath) : null;
         const running = pid !== null && isProcessAlive(pid);
-        return { running, pid: running ? pid : null, uptime: null, nanoClawPath };
+        return {
+          running,
+          pid: running ? pid : null,
+          uptime: null,
+          nanoClawPath,
+          credType,
+          ollamaModel,
+          proxyRunning,
+          proxyPid: proxyRunning ? proxyPid : null,
+        };
 
       } else if (isMac) {
             const list = execSync('launchctl list 2>/dev/null | grep nanoclaw || true', {
@@ -2467,7 +2707,15 @@ export function registerIpcHandlers(
             } catch { /* process may have just died */ }
           }
 
-          return { running: pid !== null && pid > 0, pid, uptime, nanoClawPath };
+          return {
+            running: pid !== null && pid > 0,
+            pid,
+            uptime,
+            nanoClawPath,
+            credType,
+            proxyRunning,
+            proxyPid: proxyRunning ? proxyPid : null,
+          };
         }
       } else {
             const active = execSync(
@@ -2487,11 +2735,29 @@ export function registerIpcHandlers(
           } catch { /* ignore */ }
         }
 
-        return { running, pid, uptime: null, nanoClawPath };
+        return {
+          running,
+          pid,
+          uptime: null,
+          nanoClawPath,
+          credType,
+          ollamaModel,
+          proxyRunning,
+          proxyPid: proxyRunning ? proxyPid : null,
+        };
       }
     } catch { /* ignore */ }
 
-    return { running: false, pid: null, uptime: null, nanoClawPath };
+    return {
+      running: false,
+      pid: null,
+      uptime: null,
+      nanoClawPath,
+      credType,
+      ollamaModel,
+      proxyRunning,
+      proxyPid: proxyRunning ? proxyPid : null,
+    };
   });
 
   ipcMain.handle('wizard:start-service', async () => {
@@ -2509,18 +2775,22 @@ export function registerIpcHandlers(
       if (!pid || !isProcessAlive(pid)) {
         await spawnNanoclawWindows(ncp);
       }
+      // If the user chose Ollama, also start the translation proxy.
+      await maybeStartProxy(ncp, stateManager);
     } else if (process.platform === 'darwin') {
       execSync('launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist 2>/dev/null || true');
       execSync(`launchctl kickstart gui/$(id -u)/com.nanoclaw 2>/dev/null || true`);
+      if (ncp) await maybeStartProxy(ncp, stateManager);
     } else {
       execSync('systemctl --user start nanoclaw');
+      if (ncp) await maybeStartProxy(ncp, stateManager);
     }
     return { success: true };
   });
 
   ipcMain.handle('wizard:stop-service', async () => {
+    const ncp = stateManager.get().nanoClawPath;
     if (process.platform === 'win32') {
-      const ncp = stateManager.get().nanoClawPath;
       if (ncp) {
         const pid = readNanoclawPid(ncp);
         if (pid && isProcessAlive(pid)) {
@@ -2533,6 +2803,8 @@ export function registerIpcHandlers(
     } else {
       execSync('systemctl --user stop nanoclaw');
     }
+    // Always stop the proxy too — it's useless without NanoClaw consuming it.
+    if (ncp) stopProxy(ncp);
     return { success: true };
   });
 
@@ -2552,7 +2824,79 @@ export function registerIpcHandlers(
     } else {
       execSync('systemctl --user restart nanoclaw');
     }
+    if (ncp) {
+      // Restart the proxy alongside NanoClaw so Ollama users don't need to
+      // remember to bounce it manually.
+      stopProxy(ncp);
+      await maybeStartProxy(ncp, stateManager);
+    }
     return { success: true };
+  });
+
+  // Switch the Ollama model at runtime: pull the new tag, update .env,
+  // persist to state, and bounce proxy + service so the new model is
+  // picked up without re-running the full credentials wizard.
+  ipcMain.handle('wizard:switch-ollama-model', async (_evt, model: string) => {
+    const ncp = stateManager.get().nanoClawPath;
+    if (!ncp) throw new Error('NanoClaw path not set');
+    const completed = stateManager.get().completedSteps?.credentials as
+      | { type?: string; model?: string }
+      | undefined;
+    if (!completed || completed.type !== 'ollama') {
+      throw new Error('Current credential mode is not Ollama');
+    }
+    if (!model || typeof model !== 'string') throw new Error('Invalid model name');
+    const trimmed = model.trim();
+    if (!trimmed) throw new Error('Model name cannot be empty');
+
+    const onOutput = (text: string) => {
+      window.webContents.send('wizard:output', {
+        step: 'switch-ollama-model',
+        stream: 'stdout',
+        text,
+      });
+    };
+
+    onOutput(`Switching to ${trimmed}...\n`);
+
+    // 1. Pull the model (no-op if already present)
+    const pull = await stepRunner.runCommand(
+      'switch-ollama-model',
+      'ollama',
+      ['pull', trimmed],
+    );
+    if (pull.code !== 0) {
+      throw new Error(`Failed to pull ${trimmed}`);
+    }
+
+    // 2. Update .env
+    const envPath = path.join(ncp, '.env');
+    writeEnvVar(envPath, 'NANOCLAW_LOCAL_MODEL', trimmed);
+
+    // 3. Persist new model to state so maybeStartProxy picks it up
+    stateManager.markStepComplete('credentials', {
+      type: 'ollama',
+      model: trimmed,
+    });
+
+    // 4. Bounce the proxy so OLLAMA_MODEL env refreshes
+    stopProxy(ncp);
+    await maybeStartProxy(ncp, stateManager);
+
+    // 5. Restart the service so any in-flight conversation picks up fresh
+    //    state (otherwise first replies may still use the prior model's
+    //    buffered tokens on the SDK side).
+    if (process.platform === 'win32') {
+      await spawnNanoclawWindows(ncp);
+    } else if (process.platform === 'darwin') {
+      try { execSync(`launchctl kickstart -k gui/$(id -u)/com.nanoclaw 2>/dev/null || true`); } catch { /* ignore */ }
+    } else {
+      try { execSync('systemctl --user restart nanoclaw'); } catch { /* ignore */ }
+    }
+
+    onOutput(`Switched to ${trimmed}. Proxy and service restarted.\n`);
+    window.webContents.send('wizard:state-update', stateManager.get());
+    return { success: true, model: trimmed };
   });
 
   ipcMain.handle('wizard:get-groups', async () => {
